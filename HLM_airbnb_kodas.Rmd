@@ -1,0 +1,172 @@
+---
+title: "HLM AB_NYC_2019"
+output: html_document
+---
+
+```{r paketai}
+library(dplyr)
+library(tidyverse)
+library(nlme)
+```
+
+```{r duomenys}
+data <- read.csv("AB_NYC_2019.csv")
+dim(data)
+```
+
+```{r paruosimas}
+sum(data$price == 0)
+
+data <- data %>% filter(price > 0)
+nrow(data)
+
+data$log_price <- log(data$price)
+data$room_type <- factor(data$room_type,
+                         levels = c("Entire home/apt", "Private room", "Shared room"))
+```
+
+```{r antras_lygmuo}
+haversine <- function(lat1, lon1, lat2, lon2) {
+  R <- 6371; p <- pi / 180
+  a <- sin((lat2 - lat1) * p / 2)^2 +
+       cos(lat1 * p) * cos(lat2 * p) * sin((lon2 - lon1) * p / 2)^2
+  2 * R * asin(sqrt(a))
+}
+
+rajonai <- data %>%
+  group_by(neighbourhood) %>%
+  summarise(avg_reviews = mean(number_of_reviews),
+            lat         = mean(latitude),
+            lon         = mean(longitude)) %>%
+  mutate(dist_km = haversine(lat, lon, 40.7580, -73.9855))
+
+data <- left_join(data, rajonai[c("neighbourhood", "avg_reviews", "dist_km")],
+                  by = "neighbourhood")
+
+nrow(rajonai)
+```
+
+```{r histogramos}
+par(mfrow = c(1, 2))
+hist(data$price, breaks = 100, xlab = "Kaina", ylab = "Dažnis", main = "Kaina (USD)", col = "lightgreen")
+hist(data$log_price, breaks = 30, xlab = "Log kaina", ylab = "Dažnis", main = "Logaritmuota kaina (USD)", col = "lightblue")
+```
+
+```{r koreliacijos}
+kor <- cor(data[c("log_price", "availability_365", "number_of_reviews",
+                  "minimum_nights", "calculated_host_listings_count")])
+
+myPanel <- function(x, y, z, ...) {
+  lattice::panel.levelplot(x, y, z, ...)
+  lattice::panel.text(x, y, round(z, 2), col = "black", cex = 1)
+}
+
+lattice::levelplot(
+  kor,
+  panel = myPanel,
+  col.regions = colorRampPalette(c("#2166AC", "#F7F7F7", "#1B7837"))(100),
+  at = seq(-1, 1, length.out = 101),
+  scales = list(x = list(rot = 30)),
+  main = "Koreliacijų matrica (I lygmuo)"
+)
+```
+
+```{r besalyginis}
+m0 <- lme(log_price ~ 1, data = data, random = ~1|neighbourhood)
+summary(m0)
+```
+
+```{r icc}
+tau00  <- as.numeric(VarCorr(m0)[1, 1])
+sigma2 <- as.numeric(VarCorr(m0)[2, 1])
+
+ICC <- tau00 / (tau00 + sigma2)
+ICC
+```
+
+```{r model_1}
+model_1 <- lme(log_price ~ 1 + room_type + availability_365 + number_of_reviews +
+                 minimum_nights + calculated_host_listings_count +
+                 dist_km + avg_reviews,
+               random = ~1|neighbourhood, data = data)
+summary(model_1)
+```
+
+```{r model_2}
+model_2 <- lme(log_price ~ 1 + room_type + availability_365 + number_of_reviews +
+                 minimum_nights + calculated_host_listings_count +
+                 dist_km + avg_reviews,
+               random = ~1 + room_type|neighbourhood, data = data,
+               control = lmeControl(opt = "optim"))
+summary(model_2)
+```
+
+```{r model_1_vs_model_2}
+model.1 <- update(model_1, method = "ML", data = data, control = lmeControl(opt = "optim"))
+model.2 <- update(model_2, method = "ML", data = data, control = lmeControl(opt = "optim"))
+anova(model.1, model.2)
+```
+
+```{r kintamuju_itaka}
+g2 <- fixef(model_2)
+itaka <- function(kint, x) {
+  q <- quantile(x, c(0.05, 0.95))
+  c(nuo = unname(q[1]), iki = unname(q[2]),
+    pokytis_proc = unname(round(100 * (exp(g2[kint] * (q[2] - q[1])) - 1), 2)))
+}
+rbind(availability_365  = itaka("availability_365", data$availability_365),
+      number_of_reviews = itaka("number_of_reviews", data$number_of_reviews),
+      minimum_nights    = itaka("minimum_nights", data$minimum_nights),
+      host_listings     = itaka("calculated_host_listings_count", data$calculated_host_listings_count),
+      dist_km           = itaka("dist_km", rajonai$dist_km),
+      avg_reviews       = itaka("avg_reviews", rajonai$avg_reviews))
+```
+
+```{r model_3}
+model_3 <- lme(log_price ~ 1 + room_type + availability_365 + number_of_reviews +
+                 minimum_nights + dist_km + avg_reviews,
+               random = ~1 + room_type|neighbourhood, data = data,
+               control = lmeControl(opt = "optim"))
+summary(model_3)
+```
+
+```{r ivertis}
+fixef(model_3)
+getVarCov(model_3)
+VarCorr(model_3)
+```
+
+```{r palyginimas}
+m0.ml   <- update(m0, method = "ML", data = data, control = lmeControl(opt = "optim"))
+model.3 <- update(model_3, method = "ML", data = data, control = lmeControl(opt = "optim"))
+anova(m0.ml, model.3)
+
+palyginimas <- data.frame(
+  Modelis = c("m0", "model_1", "model_2", "model_3"),
+  AIC     = round(c(AIC(m0.ml), AIC(model.1), AIC(model.2), AIC(model.3)), 1),
+  sigma2  = round(c(m0$sigma^2, model_1$sigma^2, model_2$sigma^2, model_3$sigma^2), 4))
+palyginimas$sigma2_pokytis_proc <- round(100 * (m0$sigma^2 - palyginimas$sigma2) / m0$sigma^2, 1)
+palyginimas
+```
+
+```{r aic_pokytis}
+AIC(m0.ml) - AIC(model.3)
+```
+
+```{r dispersijos_pokytis}
+(m0$sigma^2 - model_3$sigma^2) / m0$sigma^2
+```
+
+```{r liekanos_lygmuo}
+liekanos <- resid(model_3)
+
+par(mfrow = c(1, 2))
+
+hist(liekanos, breaks = 80, freq = FALSE, col = "lightblue",
+     main = "Liekanų histograma", xlab = "Liekanos", ylab = "Tankis")
+curve(dnorm(x, mean(liekanos), sd(liekanos)), add = TRUE, col = "red", lwd = 2)
+
+qqnorm(liekanos, main = "Liekanų Q-Q grafikas",
+       xlab = "Teoriniai kvantiliai", ylab = "Imties kvantiliai", pch = 20, cex = 0.3)
+qqline(liekanos, col = "red", lwd = 2)
+```
